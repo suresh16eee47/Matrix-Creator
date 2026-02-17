@@ -1,0 +1,11 @@
+INFO: [VRFC 10-163] Analyzing VHDL file "C:/Users/ITT128/Documents/matrix_creator/cmd_dispatch.vhd" into library xil_defaultlib
+INFO: [VRFC 10-3107] analyzing entity 'cmd_dispatch'
+INFO: [VRFC 10-163] Analyzing VHDL file "C:/Users/ITT128/Documents/matrix_creator/uart_8n1.vhd" into library xil_defaultlib
+INFO: [VRFC 10-3107] analyzing entity 'uart_rx_8n1'
+INFO: [VRFC 10-3107] analyzing entity 'uart_tx_8n1'
+ERROR: [VRFC 10-2935] 'start' is already declared in this region [C:/Users/ITT128/Documents/matrix_creator/uart_8n1.vhd:144]
+ERROR: [VRFC 10-1471] type error near start ; current type std_logic; expected type state_t [C:/Users/ITT128/Documents/matrix_creator/uart_8n1.vhd:180]
+ERROR: [VRFC 10-1471] type error near start ; current type std_logic; expected type state_t [C:/Users/ITT128/Documents/matrix_creator/uart_8n1.vhd:183]
+ERROR: [VRFC 10-471] case choice must be a locally static expression [C:/Users/ITT128/Documents/matrix_creator/uart_8n1.vhd:183]
+ERROR: [VRFC 10-3782] unit 'rtl' ignored due to previous errors [C:/Users/ITT128/Documents/matrix_creator/uart_8n1.vhd:140]
+INFO: [VRFC 10-3070] VHDL file 'C:/Users/ITT128/Documents/matrix_creator/uart_8n1.vhd' ignored due to errors
