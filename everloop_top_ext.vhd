@@ -3,18 +3,24 @@ use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 -- ============================================================
--- Extensible Everloop Top
--- Protocol:
---   RX: AA CMD LEN PAYLOAD[LEN] CHK 55     CHK = XOR(all previous bytes)
---   TX: CC CMD STATUS LEN DATA[LEN] CHK 33 CHK = XOR(all previous bytes)
+-- everloop_top_ext : Extensible UART-controlled SK6812RGBW driver
 --
--- Implemented commands (in cmd_dispatch):
---   0x10 SET_LED  (LEN=5) payload: idx,G,R,B,W
---   0x11 SET_ALL  (LEN=4) payload: G,R,B,W
---   0x20 MAG_READ (stub)  (LEN=0) response: 6 bytes zeros
+-- RX frame: AA CMD LEN PAYLOAD[LEN] CHK 55
+--   CHK = XOR(AA, CMD, LEN, PAYLOAD...)
 --
--- SK6812RGBW:
---   one-shot update only on change (dirty flag)
+-- TX frame: CC CMD STATUS LEN DATA[LEN] CHK 33
+--   CHK = XOR(CC, CMD, STATUS, LEN, DATA...)
+--
+-- Commands implemented in cmd_dispatch.vhd:
+--   0x10 SET_LED     LEN=5  payload: idx,G,R,B,W  -> updates 1 LED
+--   0x11 SET_ALL     LEN=4  payload: G,R,B,W      -> updates all LEDs
+--   0x12 READ_LED    LEN=1  payload: idx          -> response: LEN=4 (G,R,B,W)
+--   0x01 READ_DEFREG LEN=0  -> response: LEN=2 (0x23,0x01)
+--   0x20 MAG_READ    stub   -> response: LEN=6 zeros
+--
+-- SK6812RGBW output:
+--   Sends exactly ONE LED frame when colors change (dirty flag),
+--   otherwise led_dout stays LOW.
 -- ============================================================
 
 entity everloop_top_ext is
@@ -40,10 +46,11 @@ architecture rtl of everloop_top_ext is
   type led_mem_t is array (0 to N_LEDS-1) of std_logic_vector(31 downto 0);
   signal led_mem : led_mem_t := (others => (others => '0'));
 
-  -- UART byte stream
+  -- UART byte stream from uart_rx_8n1
   signal rx_byte   : std_logic_vector(7 downto 0) := (others => '0');
   signal rx_strobe : std_logic := '0';
 
+  -- UART byte stream to uart_tx_8n1
   signal tx_start  : std_logic := '0';
   signal tx_byte   : std_logic_vector(7 downto 0) := (others => '0');
   signal tx_busy   : std_logic := '0';
@@ -58,12 +65,21 @@ architecture rtl of everloop_top_ext is
   signal err_cmd     : std_logic_vector(7 downto 0) := (others=>'0');
   signal err_code    : std_logic_vector(7 downto 0) := (others=>'0');
 
-  -- Command dispatch outputs (LED write + response request)
-  signal led_wr_pulse  : std_logic := '0';
-  signal led_all_pulse : std_logic := '0';
-  signal led_idx_nat   : natural range 0 to N_LEDS-1 := 0;
-  signal led_pix_grbw  : std_logic_vector(31 downto 0) := (others=>'0');
+  -- Command dispatch outputs
+  signal led_wr_pulse   : std_logic := '0';
+  signal led_all_pulse  : std_logic := '0';
+  signal led_idx_nat    : natural range 0 to N_LEDS-1 := 0;
+  signal led_pix_grbw   : std_logic_vector(31 downto 0) := (others=>'0');
 
+  -- Readback interface for READ_LED
+  signal led_rd_req     : std_logic := '0';
+  signal led_rd_idx_nat : natural range 0 to N_LEDS-1 := 0;
+  signal led_rd_grbw_in : std_logic_vector(31 downto 0) := (others=>'0');
+
+  -- Default register (0x2301)
+  signal default_reg_in : std_logic_vector(15 downto 0) := x"2301";
+
+  -- Response request to resp_tx
   signal resp_req      : std_logic := '0';
   signal resp_cmd      : std_logic_vector(7 downto 0) := (others=>'0');
   signal resp_status   : std_logic_vector(7 downto 0) := (others=>'0');
@@ -96,7 +112,10 @@ architecture rtl of everloop_top_ext is
 begin
   led_dout <= dout;
 
-  -- UART RX
+  -- Provide readback combinationally from memory
+  led_rd_grbw_in <= led_mem(led_rd_idx_nat);
+
+  -- UART RX (byte-level)
   u_rx: entity work.uart_rx_8n1
     generic map (CLK_HZ => CLK_HZ, BAUD => BAUD)
     port map (
@@ -119,7 +138,7 @@ begin
       tx      => uart_tx
     );
 
-  -- Frame decoder
+  -- Frame decoder (AA..55)
   u_frx: entity work.uart_frame_rx
     generic map (MAX_PAYLOAD => MAX_PAYLOAD)
     port map (
@@ -136,7 +155,7 @@ begin
       err_code    => err_code
     );
 
-  -- Command dispatcher (add future peripherals here)
+  -- Command processor / dispatcher
   u_cmd: entity work.cmd_dispatch
     generic map (
       N_LEDS      => N_LEDS,
@@ -144,27 +163,37 @@ begin
       MAX_RESP    => MAX_RESP
     )
     port map (
-      clk          => clk50,
-      reset_n      => reset_n,
-      frame_valid  => frame_valid,
-      cmd          => f_cmd,
-      len          => f_len,
-      payload      => f_payload,
-      err_valid    => err_valid,
-      err_cmd      => err_cmd,
-      err_code     => err_code,
-      led_wr_pulse => led_wr_pulse,
-      led_all_pulse=> led_all_pulse,
-      led_idx_nat  => led_idx_nat,
-      led_pix_grbw => led_pix_grbw,
-      resp_req     => resp_req,
-      resp_cmd     => resp_cmd,
-      resp_status  => resp_status,
-      resp_len     => resp_len,
-      resp_data    => resp_data
+      clk            => clk50,
+      reset_n        => reset_n,
+
+      frame_valid    => frame_valid,
+      cmd            => f_cmd,
+      len            => f_len,
+      payload        => f_payload,
+
+      err_valid      => err_valid,
+      err_cmd        => err_cmd,
+      err_code       => err_code,
+
+      led_wr_pulse   => led_wr_pulse,
+      led_all_pulse  => led_all_pulse,
+      led_idx_nat    => led_idx_nat,
+      led_pix_grbw   => led_pix_grbw,
+
+      led_rd_req     => led_rd_req,
+      led_rd_idx_nat => led_rd_idx_nat,
+      led_rd_grbw_in => led_rd_grbw_in,
+
+      default_reg_in => default_reg_in,
+
+      resp_req       => resp_req,
+      resp_cmd       => resp_cmd,
+      resp_status    => resp_status,
+      resp_len       => resp_len,
+      resp_data      => resp_data
     );
 
-  -- Response transmitter (frame-level)
+  -- Response transmitter (CC..33) -> drives uart_tx_8n1
   u_rtx: entity work.resp_tx
     generic map (
       CLK_HZ   => CLK_HZ,
@@ -172,17 +201,20 @@ begin
       MAX_RESP => MAX_RESP
     )
     port map (
-      clk      => clk50,
-      reset_n  => reset_n,
-      req      => resp_req,
-      cmd      => resp_cmd,
-      status   => resp_status,
-      len      => resp_len,
-      data     => resp_data,
-      tx_busy  => tx_busy,
-      tx_start => tx_start,
-      tx_byte  => tx_byte,
-      busy     => resp_busy
+      clk         => clk50,
+      reset_n     => reset_n,
+
+      req         => resp_req,
+      cmd         => resp_cmd,
+      status      => resp_status,
+      len         => resp_len,
+      resp_data_in=> resp_data,
+
+      tx_busy     => tx_busy,
+      tx_start    => tx_start,
+      tx_byte     => tx_byte,
+
+      busy        => resp_busy
     );
 
   -- Apply LED writes and set dirty
@@ -192,7 +224,7 @@ begin
     if rising_edge(clk50) then
       if reset_n = '0' then
         dirty_set <= '0';
-        -- leave led_mem initialized to 0 (all off)
+        -- led_mem already init to 0 (off)
       else
         dirty_set <= '0';
 
@@ -294,7 +326,7 @@ begin
             dout <= '0';
             if led_cyc_cnt >= TRES then
               led_cyc_cnt <= 0;
-              dirty_clr   <= '1';    -- request clear
+              dirty_clr   <= '1';     -- request clear
               lstate      <= S_CLEAR; -- wait 1 clk so dirty clears before re-check
             else
               led_cyc_cnt <= led_cyc_cnt + 1;
