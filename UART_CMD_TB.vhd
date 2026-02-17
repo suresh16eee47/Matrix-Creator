@@ -12,7 +12,7 @@ architecture sim of tb_everloop_uart is
   constant N_LEDS : integer := 31;
 
   constant CLK_PERIOD : time := 20 ns;
-  constant BIT_TIME   : time := 1 sec / BAUD;  -- ~8.6805 us at 115200
+  constant BIT_TIME   : time := 1 sec / BAUD;  -- ~8.68 us @115200
 
   -- DUT signals
   signal clk50    : std_logic := '0';
@@ -21,29 +21,50 @@ architecture sim of tb_everloop_uart is
   signal uart_tx  : std_logic;
   signal led_dout : std_logic;
 
-  -- Helpers
-  procedure wait_bits(n : natural) is
+  -- VHDL-93 compatible hex helpers (no to_hstring)
+  function hex_nibble(n : std_logic_vector(3 downto 0)) return character is
   begin
-    for i in 1 to n loop
-      wait for BIT_TIME;
-    end loop;
-  end procedure;
+    case n is
+      when "0000" => return '0';
+      when "0001" => return '1';
+      when "0010" => return '2';
+      when "0011" => return '3';
+      when "0100" => return '4';
+      when "0101" => return '5';
+      when "0110" => return '6';
+      when "0111" => return '7';
+      when "1000" => return '8';
+      when "1001" => return '9';
+      when "1010" => return 'A';
+      when "1011" => return 'B';
+      when "1100" => return 'C';
+      when "1101" => return 'D';
+      when "1110" => return 'E';
+      when "1111" => return 'F';
+      when others => return 'X';
+    end case;
+  end function;
+
+  function byte_to_hex(b : std_logic_vector(7 downto 0)) return string is
+    variable s : string(1 to 2);
+  begin
+    s(1) := hex_nibble(b(7 downto 4));
+    s(2) := hex_nibble(b(3 downto 0));
+    return s;
+  end function;
 
   -- UART transmit byte onto uart_rx line (8N1, LSB first)
   procedure uart_send_byte(signal line : out std_logic; b : std_logic_vector(7 downto 0)) is
   begin
-    -- start bit
-    line <= '0';
+    line <= '0';                       -- start bit
     wait for BIT_TIME;
 
-    -- 8 data bits, LSB first
-    for i in 0 to 7 loop
+    for i in 0 to 7 loop               -- data bits LSB first
       line <= b(i);
       wait for BIT_TIME;
     end loop;
 
-    -- stop bit
-    line <= '1';
+    line <= '1';                       -- stop bit
     wait for BIT_TIME;
   end procedure;
 
@@ -52,10 +73,11 @@ architecture sim of tb_everloop_uart is
   begin
     -- wait for start bit
     wait until line = '0';
-    -- sample in the middle of the start bit, then middle of each data bit
-    wait for (BIT_TIME/2);
 
-    -- move to middle of bit0
+    -- go to middle of start bit
+    wait for BIT_TIME/2;
+
+    -- go to middle of bit0
     wait for BIT_TIME;
 
     for i in 0 to 7 loop
@@ -63,26 +85,18 @@ architecture sim of tb_everloop_uart is
       wait for BIT_TIME;
     end loop;
 
-    -- stop bit (optional check)
-    assert line = '1'
-      report "UART stop bit not high!"
-      severity warning;
+    -- stop bit should be high
+    assert line = '1' report "UART stop bit not high" severity warning;
 
-    -- wait to end of stop bit
+    -- finish stop bit time
     wait for BIT_TIME;
   end procedure;
-
-  function xor_bytes(a : std_logic_vector(7 downto 0);
-                     b : std_logic_vector(7 downto 0)) return std_logic_vector is
-  begin
-    return a xor b;
-  end function;
 
 begin
   -- Clock generation
   clk50 <= not clk50 after CLK_PERIOD/2;
 
-  -- DUT instance (must match your entity name/ports)
+  -- DUT instance (must match your entity name and ports)
   dut: entity work.everloop_led
     generic map (
       CLK_HZ => CLK_HZ,
@@ -97,21 +111,29 @@ begin
       led_dout => led_dout
     );
 
-  -- Test process
   stim: process
-    variable idx      : std_logic_vector(7 downto 0);
-    variable g, r, b, w : std_logic_vector(7 downto 0);
-    variable chk      : std_logic_vector(7 downto 0);
+    variable idx  : std_logic_vector(7 downto 0);
+    variable g    : std_logic_vector(7 downto 0);
+    variable r    : std_logic_vector(7 downto 0);
+    variable b    : std_logic_vector(7 downto 0);
+    variable w    : std_logic_vector(7 downto 0);
+    variable chk  : std_logic_vector(7 downto 0);
 
-    variable ack0, ack1, ack2, ack3, ack4, ack5 : std_logic_vector(7 downto 0);
+    variable ack0 : std_logic_vector(7 downto 0);
+    variable ack1 : std_logic_vector(7 downto 0);
+    variable ack2 : std_logic_vector(7 downto 0);
+    variable ack3 : std_logic_vector(7 downto 0);
+    variable ack4 : std_logic_vector(7 downto 0);
+    variable ack5 : std_logic_vector(7 downto 0);
+
     variable resp_chk : std_logic_vector(7 downto 0);
   begin
-    -- hold reset low briefly
+    -- Reset
     reset_n <= '0';
     uart_rx <= '1';
-    wait for 200 ns;
+    wait for 500 ns;
     reset_n <= '1';
-    wait for 200 ns;
+    wait for 500 ns;
 
     -- Build a valid command: set LED0 to BLUE (G=0,R=0,B=255,W=0)
     idx := x"00";
@@ -142,31 +164,30 @@ begin
     uart_recv_byte(uart_tx, ack5);
 
     report "ACK bytes: "
-      & to_hstring(ack0) & " "
-      & to_hstring(ack1) & " "
-      & to_hstring(ack2) & " "
-      & to_hstring(ack3) & " "
-      & to_hstring(ack4) & " "
-      & to_hstring(ack5);
+      & byte_to_hex(ack0) & " "
+      & byte_to_hex(ack1) & " "
+      & byte_to_hex(ack2) & " "
+      & byte_to_hex(ack3) & " "
+      & byte_to_hex(ack4) & " "
+      & byte_to_hex(ack5);
 
     -- Checks
     assert ack0 = x"CC" report "ACK[0] not 0xCC" severity failure;
     assert ack5 = x"33" report "ACK[5] not 0x33" severity failure;
     assert ack1 = idx   report "ACK idx mismatch" severity failure;
 
-    -- status should be 0x00 for OK
+    -- status should be OK
     assert ack2 = x"00" report "ACK status not OK (0x00)" severity failure;
 
     -- echo checksum should match sent chk
-    assert ack3 = chk   report "ACK echo_chk mismatch" severity failure;
+    assert ack3 = chk report "ACK echo_chk mismatch" severity failure;
 
     -- resp_chk = XOR(CC, idx, status, echo_chk)
     resp_chk := ack0 xor ack1 xor ack2 xor ack3;
     assert ack4 = resp_chk report "ACK resp_chk mismatch" severity failure;
 
-    report "UART RX/ACK test PASSED" severity note;
+    report "UART RX + ACK test PASSED" severity note;
 
-    -- End simulation
     wait for 1 ms;
     assert false report "Simulation finished" severity failure;
   end process;
