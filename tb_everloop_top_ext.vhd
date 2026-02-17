@@ -2,59 +2,80 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
-entity tb_everloop_top_ext is
+entity tb_read_default_reg is
 end entity;
 
-architecture sim of tb_everloop_top_ext is
+architecture sim of tb_read_default_reg is
+  -- Match your DUT generics
   constant CLK_HZ : integer := 50_000_000;
   constant BAUD   : integer := 115200;
-  constant N_LEDS : integer := 31;
-  constant MAX_PAYLOAD : integer := 32;
-  constant MAX_RESP    : integer := 32;
 
   constant CLK_PERIOD : time := 20 ns;
-  constant BAUD_DIV   : integer := CLK_HZ / BAUD;         -- 434
-  constant BIT_TIME   : time := BAUD_DIV * CLK_PERIOD;    -- 8680 ns
+  constant BAUD_DIV   : integer := CLK_HZ / BAUD;          -- 434
+  constant BIT_TIME   : time := BAUD_DIV * CLK_PERIOD;     -- 8.68 us approx
 
   signal clk50    : std_logic := '0';
   signal reset_n  : std_logic := '0';
-  signal uart_rx  : std_logic := '1';
+  signal uart_rx  : std_logic := '1';  -- idle high
   signal uart_tx  : std_logic;
   signal led_dout : std_logic;
 
-  -- UART helpers
+  -- -------- HEX helper (works in VHDL-93/2002/2008) --------
+  function nibble_to_hex(n : std_logic_vector(3 downto 0)) return character is
+    variable u : integer := to_integer(unsigned(n));
+  begin
+    if u < 10 then
+      return character'val(character'pos('0') + u);
+    else
+      return character'val(character'pos('A') + (u - 10));
+    end if;
+  end function;
+
+  function byte_to_hex(b : std_logic_vector(7 downto 0)) return string is
+    variable s : string(1 to 2);
+  begin
+    s(1) := nibble_to_hex(b(7 downto 4));
+    s(2) := nibble_to_hex(b(3 downto 0));
+    return s;
+  end function;
+
+  -- -------- UART helpers --------
   procedure uart_send_byte(signal line : out std_logic; b : std_logic_vector(7 downto 0)) is
   begin
-    -- start
+    -- start bit
     line <= '0';
     wait for BIT_TIME;
 
-    -- data LSB first
+    -- data bits LSB first
     for i in 0 to 7 loop
       line <= b(i);
       wait for BIT_TIME;
     end loop;
 
-    -- stop
+    -- stop bit
     line <= '1';
     wait for BIT_TIME;
   end procedure;
 
   procedure uart_recv_byte(signal line : in std_logic; variable b : out std_logic_vector(7 downto 0)) is
   begin
-    -- wait start edge
-    wait until (line = '0' and line'event);
+    -- wait for start bit falling edge
+    wait until (line'event and line = '0');
 
-    -- to center of bit0 (1.5 bit)
+    -- move to center of bit0 (1.5 bit times from start edge)
     wait for BIT_TIME + (BIT_TIME/2);
 
+    -- sample 8 data bits (LSB first)
     for i in 0 to 7 loop
       b(i) := line;
       wait for BIT_TIME;
     end loop;
 
-    -- stop bit center
-    assert line = '1' report "Stop bit not high (sampling)" severity warning;
+    -- sample stop bit center (optional check)
+    if line /= '1' then
+      report "WARNING: stop bit not high" severity warning;
+    end if;
+
     wait for BIT_TIME/2;
   end procedure;
 
@@ -62,14 +83,14 @@ begin
   -- clock
   clk50 <= not clk50 after CLK_PERIOD/2;
 
-  -- DUT
+  -- DUT (your top module)
   dut: entity work.everloop_top_ext
     generic map (
       CLK_HZ      => CLK_HZ,
       BAUD        => BAUD,
-      N_LEDS      => N_LEDS,
-      MAX_PAYLOAD => MAX_PAYLOAD,
-      MAX_RESP    => MAX_RESP
+      N_LEDS      => 31,
+      MAX_PAYLOAD => 32,
+      MAX_RESP    => 32
     )
     port map (
       clk50    => clk50,
@@ -80,73 +101,63 @@ begin
     );
 
   stim: process
-    variable sof, eof  : std_logic_vector(7 downto 0);
-    variable cmd, len  : std_logic_vector(7 downto 0);
-    variable p0,p1,p2,p3,p4 : std_logic_vector(7 downto 0);
-    variable chk : std_logic_vector(7 downto 0);
-
-    variable r0,r1,r2,r3,r4,r5 : std_logic_vector(7 downto 0);
-    variable exp_chk : std_logic_vector(7 downto 0);
+    variable b0,b1,b2,b3,b4,b5,b6,b7 : std_logic_vector(7 downto 0);
   begin
-    uart_rx <= '1';
-
     -- reset
+    uart_rx <= '1';
     reset_n <= '0';
-    wait for 5 us;
+    wait for 10 us;
     reset_n <= '1';
-    wait for 5 us;
+    wait for 10 us;
 
-    -- Build SET_LED (0x10) LEN=5 payload: idx=0, G=0, R=0, B=FF, W=0
-    sof := x"AA";
-    eof := x"55";
-    cmd := x"10";
-    len := x"05";
-    p0  := x"00"; -- idx
-    p1  := x"00"; -- G
-    p2  := x"00"; -- R
-    p3  := x"FF"; -- B
-    p4  := x"00"; -- W
+    --------------------------------------------------------------------
+    -- Send READ_DEFAULT_REG command:
+    -- TX: AA 01 00 AB 55   (CHK = AA xor 01 xor 00 = AB)
+    --------------------------------------------------------------------
+    report "Sending READ_DEFAULT_REG: AA 01 00 AB 55" severity note;
 
-    chk := sof xor cmd xor len xor p0 xor p1 xor p2 xor p3 xor p4;
+    uart_send_byte(uart_rx, x"AA");
+    uart_send_byte(uart_rx, x"01");
+    uart_send_byte(uart_rx, x"00");
+    uart_send_byte(uart_rx, x"AB");
+    uart_send_byte(uart_rx, x"55");
 
-    -- Send RX frame: AA CMD LEN payload... CHK 55
-    uart_send_byte(uart_rx, sof);
-    uart_send_byte(uart_rx, cmd);
-    uart_send_byte(uart_rx, len);
-    uart_send_byte(uart_rx, p0);
-    uart_send_byte(uart_rx, p1);
-    uart_send_byte(uart_rx, p2);
-    uart_send_byte(uart_rx, p3);
-    uart_send_byte(uart_rx, p4);
-    uart_send_byte(uart_rx, chk);
-    uart_send_byte(uart_rx, eof);
+    --------------------------------------------------------------------
+    -- Receive response bytes and print in HEX:
+    -- Expected: CC 01 00 02 23 01 ED 33
+    --------------------------------------------------------------------
+    uart_recv_byte(uart_tx, b0);
+    uart_recv_byte(uart_tx, b1);
+    uart_recv_byte(uart_tx, b2);
+    uart_recv_byte(uart_tx, b3);
+    uart_recv_byte(uart_tx, b4);
+    uart_recv_byte(uart_tx, b5);
+    uart_recv_byte(uart_tx, b6);
+    uart_recv_byte(uart_tx, b7);
 
-    -- Receive TX response:
-    -- CC CMD STATUS LEN DATA[LEN] CHK 33
-    uart_recv_byte(uart_tx, r0); -- CC
-    uart_recv_byte(uart_tx, r1); -- CMD
-    uart_recv_byte(uart_tx, r2); -- STATUS
-    uart_recv_byte(uart_tx, r3); -- LEN
-    -- LEN=0 expected for SET_LED OK, so next is CHK then 33
-    uart_recv_byte(uart_tx, r4); -- CHK
-    uart_recv_byte(uart_tx, r5); -- 33
+    report "Response bytes: "
+      & byte_to_hex(b0) & " "
+      & byte_to_hex(b1) & " "
+      & byte_to_hex(b2) & " "
+      & byte_to_hex(b3) & " "
+      & byte_to_hex(b4) & " "
+      & byte_to_hex(b5) & " "
+      & byte_to_hex(b6) & " "
+      & byte_to_hex(b7) severity note;
 
-    -- Check fixed fields
-    assert r0 = x"CC" report "Bad response SOF (expected CC)" severity failure;
-    assert r1 = cmd   report "Bad response CMD" severity failure;
-    assert r2 = x"00" report "Bad response STATUS (expected 00)" severity failure;
-    assert r3 = x"00" report "Bad response LEN (expected 00)" severity failure;
-    assert r5 = x"33" report "Bad response EOF (expected 33)" severity failure;
+    -- Hard checks
+    assert b0 = x"CC" report "Bad SOF (expected CC)" severity failure;
+    assert b1 = x"01" report "Bad CMD (expected 01)" severity failure;
+    assert b2 = x"00" report "Bad STATUS (expected 00)" severity failure;
+    assert b3 = x"02" report "Bad LEN (expected 02)" severity failure;
+    assert b4 = x"23" report "Bad DATA[0] (expected 23)" severity failure;
+    assert b5 = x"01" report "Bad DATA[1] (expected 01)" severity failure;
+    assert b6 = x"ED" report "Bad CHK (expected ED)" severity failure;
+    assert b7 = x"33" report "Bad EOF (expected 33)" severity failure;
 
-    -- Check XOR checksum: XOR(CC, CMD, STATUS, LEN)
-    exp_chk := x"CC" xor r1 xor r2 xor r3;
-    assert r4 = exp_chk report "Bad response CHK" severity failure;
+    report "READ_DEFAULT_REG test PASSED" severity note;
 
-    report "UART protocol test PASSED" severity note;
-
-    -- Let LED frame run (optional)
-    wait for 2 ms;
-
+    wait for 200 us;
     assert false report "Simulation finished" severity failure;
   end process;
 
