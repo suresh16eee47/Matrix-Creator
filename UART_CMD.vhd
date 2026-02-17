@@ -1,12 +1,18 @@
-
 library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
 -- ============================================================
--- SK6812RGBW (GRBW) + UART control + UART ACK response
+-- everloop_led : SK6812RGBW (GRBW) one-shot streamer + UART control + UART ACK
 -- Clock: 50 MHz
--- UART: 115200 8N1 (configurable via generics)
+-- UART: 115200 8N1 (generic)
+-- LEDs: 31 (generic)
+--
+-- Key behavior:
+--  - led_dout stays LOW (idle) when there is no change.
+--  - After a VALID UART command updates a LED color, a single full SK6812 frame
+--    is transmitted, then line returns LOW again (no continuous refresh).
+--  - UART ACK is sent for every parsed command (OK or error).
 --
 -- RX command (8 bytes):
 --   AA  idx  G  R  B  W  chk  55
@@ -21,8 +27,7 @@ use ieee.numeric_std.all;
 --     02 BAD_END_BYTE
 --     03 BAD_INDEX
 --
--- Fix for multi-driver:
---   ack_pending is driven by ONE process only, using ack_set/ack_clr pulses.
+-- reset_n: active-low
 -- ============================================================
 
 entity everloop_led is
@@ -33,7 +38,7 @@ entity everloop_led is
   );
   port (
     clk50    : in  std_logic;
-    reset_n  : in  std_logic := '1'; -- active-low for this module
+    reset_n  : in  std_logic;  -- active-low
     uart_rx  : in  std_logic;
     uart_tx  : out std_logic;
     led_dout : out std_logic
@@ -49,28 +54,27 @@ architecture rtl of everloop_led is
   signal led_mem : led_mem_t := (others => (others => '0'));
 
   ----------------------------------------------------------------------------
-  -- UART common
+  -- UART constants
   ----------------------------------------------------------------------------
-  constant BAUD_DIV : natural := CLK_HZ / BAUD;  -- e.g. 50e6/115200=434
+  constant BAUD_DIV : natural := CLK_HZ / BAUD; -- e.g. 434 for 50MHz/115200
 
   ----------------------------------------------------------------------------
-  -- UART RX (8N1)
+  -- UART RX (8N1) signals
   ----------------------------------------------------------------------------
   type urx_state_t is (URX_IDLE, URX_START, URX_DATA, URX_STOP);
   signal urx_state  : urx_state_t := URX_IDLE;
   signal urx_divcnt : natural range 0 to BAUD_DIV := 0;
   signal urx_bitcnt : integer range 0 to 7 := 0;
   signal urx_shift  : std_logic_vector(7 downto 0) := (others => '0');
-
-  signal rx_byte   : std_logic_vector(7 downto 0) := (others => '0');
-  signal rx_strobe : std_logic := '0';
+  signal rx_byte    : std_logic_vector(7 downto 0) := (others => '0');
+  signal rx_strobe  : std_logic := '0';
 
   -- RX synchronizer
   signal rx_ff1, rx_ff2 : std_logic := '1';
   signal rx_sync        : std_logic := '1';
 
   ----------------------------------------------------------------------------
-  -- UART TX (8N1) : byte-level sender
+  -- UART TX (8N1) byte sender
   ----------------------------------------------------------------------------
   type utx_state_t is (UTX_IDLE, UTX_START, UTX_DATA, UTX_STOP);
   signal utx_state  : utx_state_t := UTX_IDLE;
@@ -80,11 +84,11 @@ architecture rtl of everloop_led is
   signal utx_line   : std_logic := '1';
 
   signal tx_busy  : std_logic := '0';
-  signal tx_start : std_logic := '0';
+  signal tx_start : std_logic := '0';  -- pulse
   signal tx_byte  : std_logic_vector(7 downto 0) := (others => '0');
 
   ----------------------------------------------------------------------------
-  -- ACK sender (6 bytes): CC idx status echo_chk resp_chk 33
+  -- ACK sender
   ----------------------------------------------------------------------------
   type ack_state_t is (A_IDLE, A_B0, A_B1, A_B2, A_B3, A_B4, A_B5);
   signal ack_state : ack_state_t := A_IDLE;
@@ -94,10 +98,17 @@ architecture rtl of everloop_led is
   signal ack_echo_chk : std_logic_vector(7 downto 0) := (others => '0');
   signal ack_resp_chk : std_logic_vector(7 downto 0) := (others => '0');
 
-  -- ack_pending driven by ONE process using set/clear pulses
+  -- ack_pending single-driver using set/clear pulses
   signal ack_pending : std_logic := '0';
   signal ack_set     : std_logic := '0';
   signal ack_clr     : std_logic := '0';
+
+  ----------------------------------------------------------------------------
+  -- Dirty flag (send SK6812 only on change)
+  ----------------------------------------------------------------------------
+  signal dirty     : std_logic := '0';
+  signal dirty_set : std_logic := '0';
+  signal dirty_clr : std_logic := '0';
 
   ----------------------------------------------------------------------------
   -- Command parser: AA idx G R B W chk 55
@@ -112,15 +123,15 @@ architecture rtl of everloop_led is
   signal calc_xor : std_logic_vector(7 downto 0) := (others => '0');
 
   ----------------------------------------------------------------------------
-  -- SK6812RGBW streamer (GRBW) from led_mem
+  -- SK6812RGBW timing @50MHz
   ----------------------------------------------------------------------------
-  constant TBIT : natural := 63;    -- ~1.26us @50MHz
+  constant TBIT : natural := 63;    -- ~1.26us
   constant T0H  : natural := 15;    -- ~0.30us
   constant T1H  : natural := 30;    -- ~0.60us
-  constant TRES : natural := 5000;  -- 100us latch low
+  constant TRES : natural := 5000;  -- 100us low reset
 
-  type led_state_t is (S_LATCH_LOW, S_LOAD, S_SEND_BIT, S_NEXT_BIT, S_NEXT_LED);
-  signal lstate  : led_state_t := S_LATCH_LOW;
+  type led_state_t is (S_IDLE, S_LOAD, S_SEND_BIT, S_NEXT_BIT, S_NEXT_LED, S_LATCH_LOW);
+  signal lstate : led_state_t := S_IDLE;
 
   signal led_cyc_cnt : natural range 0 to 10000 := 0;
   signal led_idx     : natural range 0 to N_LEDS-1 := 0;
@@ -129,8 +140,8 @@ architecture rtl of everloop_led is
   signal dout        : std_logic := '0';
 
 begin
-  led_dout <= dout;
   uart_tx  <= utx_line;
+  led_dout <= dout;
 
   ----------------------------------------------------------------------------
   -- RX synchronizer
@@ -145,7 +156,7 @@ begin
   end process;
 
   ----------------------------------------------------------------------------
-  -- UART RX (8N1)
+  -- UART RX (8N1, mid-bit sampling)
   ----------------------------------------------------------------------------
   process(clk50)
   begin
@@ -167,9 +178,9 @@ begin
 
           when URX_START =>
             if urx_divcnt = (BAUD_DIV/2) then
+              urx_divcnt <= 0;
               if rx_sync = '0' then
                 urx_state  <= URX_DATA;
-                urx_divcnt <= 0;
                 urx_bitcnt <= 0;
               else
                 urx_state <= URX_IDLE;
@@ -208,7 +219,7 @@ begin
   end process;
 
   ----------------------------------------------------------------------------
-  -- UART TX byte sender (8N1)
+  -- UART TX byte sender (8N1). Accept tx_start only when idle.
   ----------------------------------------------------------------------------
   process(clk50)
   begin
@@ -256,7 +267,7 @@ begin
             end if;
 
           when UTX_STOP =>
-            utx_line <= '1';
+            utx_line <= '1'; -- full stop-bit time
             if utx_divcnt = BAUD_DIV-1 then
               utx_divcnt <= 0;
               utx_state  <= UTX_IDLE;
@@ -269,7 +280,7 @@ begin
   end process;
 
   ----------------------------------------------------------------------------
-  -- ack_pending single-driver process (set/clear pulses)
+  -- ack_pending single-driver latch (set/clear pulses)
   ----------------------------------------------------------------------------
   process(clk50)
   begin
@@ -287,7 +298,25 @@ begin
   end process;
 
   ----------------------------------------------------------------------------
-  -- Command parser + LED write + prepare ACK fields + pulse ack_set
+  -- dirty single-driver latch (set/clear pulses)
+  ----------------------------------------------------------------------------
+  process(clk50)
+  begin
+    if rising_edge(clk50) then
+      if reset_n = '0' then
+        dirty <= '0';
+      else
+        if dirty_set = '1' then
+          dirty <= '1';
+        elsif dirty_clr = '1' then
+          dirty <= '0';
+        end if;
+      end if;
+    end if;
+  end process;
+
+  ----------------------------------------------------------------------------
+  -- Command parser + LED write + prepare ACK + pulses ack_set and dirty_set
   ----------------------------------------------------------------------------
   process(clk50)
     variable b     : std_logic_vector(7 downto 0);
@@ -296,12 +325,14 @@ begin
   begin
     if rising_edge(clk50) then
       if reset_n = '0' then
-        pstate   <= P_WAIT_AA;
-        calc_xor <= (others => '0');
-        tmp_chk  <= (others => '0');
-        ack_set  <= '0';
+        pstate    <= P_WAIT_AA;
+        calc_xor  <= (others => '0');
+        tmp_chk   <= (others => '0');
+        ack_set   <= '0';
+        dirty_set <= '0';
       else
-        ack_set <= '0'; -- default pulse low
+        ack_set   <= '0';  -- 1-cycle pulse
+        dirty_set <= '0';  -- 1-cycle pulse
 
         if rx_strobe = '1' then
           b := rx_byte;
@@ -321,7 +352,7 @@ begin
                 calc_xor    <= calc_xor xor b;
                 pstate      <= P_G;
               else
-                -- Bad index -> NACK
+                -- BAD_INDEX => immediate NACK
                 ack_idx      <= b;
                 ack_echo_chk <= x"00";
                 ack_status   <= x"03";
@@ -347,16 +378,18 @@ begin
               pstate  <= P_WAIT_55;
 
             when P_WAIT_55 =>
+              -- Prepare ACK fields
               ack_idx      <= tmp_idx_b;
               ack_echo_chk <= tmp_chk;
 
               if b /= x"55" then
-                st := x"02"; -- bad end
+                st := x"02"; -- BAD_END_BYTE
               elsif tmp_chk /= calc_xor then
-                st := x"01"; -- bad checksum
+                st := x"01"; -- BAD_CHECKSUM
               else
-                st := x"00"; -- OK
+                st := x"00"; -- OK: apply update
                 led_mem(tmp_idx_nat) <= tmp_g & tmp_r & tmp_b & tmp_w; -- GRBW
+                dirty_set <= '1'; -- trigger one-shot LED refresh
               end if;
 
               ack_status   <= st;
@@ -371,7 +404,7 @@ begin
   end process;
 
   ----------------------------------------------------------------------------
-  -- ACK transmitter FSM (6 bytes), pulses tx_start; clears with ack_clr
+  -- ACK transmitter FSM (6 bytes) + clear ack_pending at end
   ----------------------------------------------------------------------------
   process(clk50)
   begin
@@ -431,7 +464,7 @@ begin
               tx_byte   <= x"33";
               tx_start  <= '1';
               ack_state <= A_IDLE;
-              ack_clr   <= '1'; -- clear pending AFTER launching last byte
+              ack_clr   <= '1';
             end if;
         end case;
       end if;
@@ -439,7 +472,9 @@ begin
   end process;
 
   ----------------------------------------------------------------------------
-  -- SK6812RGBW streamer: continuously transmits led_mem
+  -- SK6812 one-shot streamer:
+  --  - dout LOW in S_IDLE
+  --  - when dirty=1, send full frame then hold LOW for TRES then dirty_clr
   ----------------------------------------------------------------------------
   process(clk50)
     variable this_bit : std_logic;
@@ -447,22 +482,23 @@ begin
   begin
     if rising_edge(clk50) then
       if reset_n = '0' then
-        lstate      <= S_LATCH_LOW;
+        lstate      <= S_IDLE;
         led_cyc_cnt <= 0;
         led_idx     <= 0;
         bit_idx     <= 31;
         pix32       <= (others => '0');
         dout        <= '0';
+        dirty_clr   <= '0';
       else
+        dirty_clr <= '0'; -- pulse
+
         case lstate is
-          when S_LATCH_LOW =>
-            dout <= '0';
-            if led_cyc_cnt >= TRES then
-              led_cyc_cnt <= 0;
-              led_idx     <= 0;
-              lstate      <= S_LOAD;
-            else
-              led_cyc_cnt <= led_cyc_cnt + 1;
+          when S_IDLE =>
+            dout        <= '0';
+            led_cyc_cnt <= 0;
+            if dirty = '1' then
+              led_idx <= 0;
+              lstate  <= S_LOAD;
             end if;
 
           when S_LOAD =>
@@ -502,6 +538,16 @@ begin
             else
               led_idx <= led_idx + 1;
               lstate  <= S_LOAD;
+            end if;
+
+          when S_LATCH_LOW =>
+            dout <= '0';
+            if led_cyc_cnt >= TRES then
+              led_cyc_cnt <= 0;
+              lstate      <= S_IDLE;
+              dirty_clr   <= '1'; -- clear dirty after one-shot completes
+            else
+              led_cyc_cnt <= led_cyc_cnt + 1;
             end if;
         end case;
       end if;
