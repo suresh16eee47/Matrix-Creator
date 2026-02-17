@@ -2,17 +2,28 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
+-- ============================================================
+-- Testbench: READ_DEFAULT_REG (0x2301)
+-- Sends:    AA 01 00 AB 55
+-- Expects:  CC 01 00 02 23 01 ED 33
+--
+-- Robust UART RX decoder in TB:
+--  - waits for idle-high
+--  - validates start bit (still low at mid-start)
+--  - samples data at centers
+--  - samples stop at center (prevents false warnings on back-to-back bytes)
+-- ============================================================
+
 entity tb_read_default_reg is
 end entity;
 
 architecture sim of tb_read_default_reg is
-  -- Match your DUT generics
   constant CLK_HZ : integer := 50_000_000;
   constant BAUD   : integer := 115200;
 
   constant CLK_PERIOD : time := 20 ns;
   constant BAUD_DIV   : integer := CLK_HZ / BAUD;          -- 434
-  constant BIT_TIME   : time := BAUD_DIV * CLK_PERIOD;     -- 8.68 us approx
+  constant BIT_TIME   : time := BAUD_DIV * CLK_PERIOD;     -- 8.68 us
 
   signal clk50    : std_logic := '0';
   signal reset_n  : std_logic := '0';
@@ -20,7 +31,7 @@ architecture sim of tb_read_default_reg is
   signal uart_tx  : std_logic;
   signal led_dout : std_logic;
 
-  -- -------- HEX helper (works in VHDL-93/2002/2008) --------
+  -- ---------- HEX helpers (VHDL-93 compatible) ----------
   function nibble_to_hex(n : std_logic_vector(3 downto 0)) return character is
     variable u : integer := to_integer(unsigned(n));
   begin
@@ -39,51 +50,62 @@ architecture sim of tb_read_default_reg is
     return s;
   end function;
 
-  -- -------- UART helpers --------
+  -- ---------- UART helpers ----------
   procedure uart_send_byte(signal line : out std_logic; b : std_logic_vector(7 downto 0)) is
   begin
-    -- start bit
+    -- start
     line <= '0';
     wait for BIT_TIME;
 
-    -- data bits LSB first
+    -- data LSB first
     for i in 0 to 7 loop
       line <= b(i);
       wait for BIT_TIME;
     end loop;
 
-    -- stop bit
+    -- stop
     line <= '1';
     wait for BIT_TIME;
   end procedure;
 
+  -- Robust receive: avoids false "stop bit low" due to edge mis-lock/drift
   procedure uart_recv_byte(signal line : in std_logic; variable b : out std_logic_vector(7 downto 0)) is
   begin
-    -- wait for start bit falling edge
-    wait until (line'event and line = '0');
+    -- Ensure idle high before searching start bit
+    if line /= '1' then
+      wait until line = '1';
+    end if;
 
-    -- move to center of bit0 (1.5 bit times from start edge)
-    wait for BIT_TIME + (BIT_TIME/2);
+    -- Find a VALID start bit (falling edge + still low at mid-start)
+    loop
+      wait until (line'event and line = '0');  -- candidate start edge
+      wait for BIT_TIME/2;                     -- middle of start bit
+      exit when line = '0';                    -- accept only if still low
+      -- otherwise it was a data-edge/glitch, continue searching
+    end loop;
 
-    -- sample 8 data bits (LSB first)
+    -- Now go to center of bit0 (from mid-start -> mid-bit0 is +1 bit)
+    wait for BIT_TIME;
+
+    -- Sample 8 data bits at centers (LSB first)
     for i in 0 to 7 loop
       b(i) := line;
       wait for BIT_TIME;
     end loop;
 
-    -- sample stop bit center (optional check)
+    -- We are now at START of stop bit; sample at CENTER of stop bit
+    wait for BIT_TIME/2;
     if line /= '1' then
-      report "WARNING: stop bit not high" severity warning;
+      report "Stop bit not high (sampling)" severity warning;
     end if;
-
     wait for BIT_TIME/2;
   end procedure;
 
 begin
-  -- clock
+  -- clock generation
   clk50 <= not clk50 after CLK_PERIOD/2;
 
-  -- DUT (your top module)
+  -- DUT instantiation
   dut: entity work.everloop_top_ext
     generic map (
       CLK_HZ      => CLK_HZ,
@@ -101,59 +123,53 @@ begin
     );
 
   stim: process
-    variable b0,b1,b2,b3,b4,b5,b6,b7 : std_logic_vector(7 downto 0);
+    variable r0,r1,r2,r3,r4,r5,r6,r7 : std_logic_vector(7 downto 0);
   begin
-    -- reset
     uart_rx <= '1';
+
+    -- reset
     reset_n <= '0';
-    wait for 10 us;
+    wait for 20 us;
     reset_n <= '1';
-    wait for 10 us;
+    wait for 20 us;
 
-    --------------------------------------------------------------------
-    -- Send READ_DEFAULT_REG command:
-    -- TX: AA 01 00 AB 55   (CHK = AA xor 01 xor 00 = AB)
-    --------------------------------------------------------------------
-    report "Sending READ_DEFAULT_REG: AA 01 00 AB 55" severity note;
-
+    -- Send READ_DEFAULT_REG: AA 01 00 AB 55
+    report "TX: AA 01 00 AB 55 (READ_DEFAULT_REG)" severity note;
     uart_send_byte(uart_rx, x"AA");
     uart_send_byte(uart_rx, x"01");
     uart_send_byte(uart_rx, x"00");
     uart_send_byte(uart_rx, x"AB");
     uart_send_byte(uart_rx, x"55");
 
-    --------------------------------------------------------------------
-    -- Receive response bytes and print in HEX:
-    -- Expected: CC 01 00 02 23 01 ED 33
-    --------------------------------------------------------------------
-    uart_recv_byte(uart_tx, b0);
-    uart_recv_byte(uart_tx, b1);
-    uart_recv_byte(uart_tx, b2);
-    uart_recv_byte(uart_tx, b3);
-    uart_recv_byte(uart_tx, b4);
-    uart_recv_byte(uart_tx, b5);
-    uart_recv_byte(uart_tx, b6);
-    uart_recv_byte(uart_tx, b7);
+    -- Receive response: CC 01 00 02 23 01 ED 33
+    uart_recv_byte(uart_tx, r0);
+    uart_recv_byte(uart_tx, r1);
+    uart_recv_byte(uart_tx, r2);
+    uart_recv_byte(uart_tx, r3);
+    uart_recv_byte(uart_tx, r4);
+    uart_recv_byte(uart_tx, r5);
+    uart_recv_byte(uart_tx, r6);
+    uart_recv_byte(uart_tx, r7);
 
-    report "Response bytes: "
-      & byte_to_hex(b0) & " "
-      & byte_to_hex(b1) & " "
-      & byte_to_hex(b2) & " "
-      & byte_to_hex(b3) & " "
-      & byte_to_hex(b4) & " "
-      & byte_to_hex(b5) & " "
-      & byte_to_hex(b6) & " "
-      & byte_to_hex(b7) severity note;
+    report "RX: "
+      & byte_to_hex(r0) & " "
+      & byte_to_hex(r1) & " "
+      & byte_to_hex(r2) & " "
+      & byte_to_hex(r3) & " "
+      & byte_to_hex(r4) & " "
+      & byte_to_hex(r5) & " "
+      & byte_to_hex(r6) & " "
+      & byte_to_hex(r7) severity note;
 
-    -- Hard checks
-    assert b0 = x"CC" report "Bad SOF (expected CC)" severity failure;
-    assert b1 = x"01" report "Bad CMD (expected 01)" severity failure;
-    assert b2 = x"00" report "Bad STATUS (expected 00)" severity failure;
-    assert b3 = x"02" report "Bad LEN (expected 02)" severity failure;
-    assert b4 = x"23" report "Bad DATA[0] (expected 23)" severity failure;
-    assert b5 = x"01" report "Bad DATA[1] (expected 01)" severity failure;
-    assert b6 = x"ED" report "Bad CHK (expected ED)" severity failure;
-    assert b7 = x"33" report "Bad EOF (expected 33)" severity failure;
+    -- Assertions
+    assert r0 = x"CC" report "Bad SOF (expected CC)" severity failure;
+    assert r1 = x"01" report "Bad CMD (expected 01)" severity failure;
+    assert r2 = x"00" report "Bad STATUS (expected 00)" severity failure;
+    assert r3 = x"02" report "Bad LEN (expected 02)" severity failure;
+    assert r4 = x"23" report "Bad DATA[0] (expected 23)" severity failure;
+    assert r5 = x"01" report "Bad DATA[1] (expected 01)" severity failure;
+    assert r6 = x"ED" report "Bad CHK (expected ED)" severity failure;
+    assert r7 = x"33" report "Bad EOF (expected 33)" severity failure;
 
     report "READ_DEFAULT_REG test PASSED" severity note;
 
