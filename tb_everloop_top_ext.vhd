@@ -2,23 +2,36 @@ library ieee;
 use ieee.std_logic_1164.all;
 use ieee.numeric_std.all;
 
-entity tb_read_default_reg_clkmon is
+-- ============================================================
+-- Testbench: READ_DEFAULT_REG (0x2301)
+-- Sends:    AA 01 00 AB 55
+-- Expects:  CC 01 00 02 23 01 ED 33
+--
+-- Robust UART RX decoder in TB:
+--  - waits for idle-high
+--  - validates start bit (still low at mid-start)
+--  - samples data at centers
+--  - samples stop at center (prevents false warnings on back-to-back bytes)
+-- ============================================================
+
+entity tb_read_default_reg is
 end entity;
 
-architecture sim of tb_read_default_reg_clkmon is
+architecture sim of tb_read_default_reg is
   constant CLK_HZ : integer := 50_000_000;
   constant BAUD   : integer := 115200;
 
   constant CLK_PERIOD : time := 20 ns;
-  constant BAUD_DIV   : integer := CLK_HZ / BAUD;  -- 434 clocks/bit (matches DUT)
+  constant BAUD_DIV   : integer := CLK_HZ / BAUD;          -- 434
+  constant BIT_TIME   : time := BAUD_DIV * CLK_PERIOD;     -- 8.68 us
 
   signal clk50    : std_logic := '0';
   signal reset_n  : std_logic := '0';
-  signal uart_rx  : std_logic := '1';
+  signal uart_rx  : std_logic := '1';  -- idle high
   signal uart_tx  : std_logic;
   signal led_dout : std_logic;
 
-  -- ------------ HEX helpers (VHDL-93 compatible) ------------
+  -- ---------- HEX helpers (VHDL-93 compatible) ----------
   function nibble_to_hex(n : std_logic_vector(3 downto 0)) return character is
     variable u : integer := to_integer(unsigned(n));
   begin
@@ -37,30 +50,62 @@ architecture sim of tb_read_default_reg_clkmon is
     return s;
   end function;
 
-  -- ------------ TX (Pi->FPGA) byte sender using time ------------
-  -- This is OK because it doesn't need to decode; it only drives uart_rx.
-  constant BIT_TIME : time := BAUD_DIV * CLK_PERIOD;
-
+  -- ---------- UART helpers ----------
   procedure uart_send_byte(signal line : out std_logic; b : std_logic_vector(7 downto 0)) is
   begin
-    line <= '0'; wait for BIT_TIME;         -- start
+    -- start
+    line <= '0';
+    wait for BIT_TIME;
+
+    -- data LSB first
     for i in 0 to 7 loop
-      line <= b(i); wait for BIT_TIME;      -- LSB first
+      line <= b(i);
+      wait for BIT_TIME;
     end loop;
-    line <= '1'; wait for BIT_TIME;         -- stop
+
+    -- stop
+    line <= '1';
+    wait for BIT_TIME;
   end procedure;
 
-  -- ------------ UART monitor outputs ------------
-  type byte_array_t is array (0 to 7) of std_logic_vector(7 downto 0);
-  signal rx_bytes : byte_array_t := (others => (others => '0'));
-  signal rx_count : integer range 0 to 8 := 0;
-  signal got_packet : std_logic := '0';
+  -- Robust receive: avoids false "stop bit low" due to edge mis-lock/drift
+  procedure uart_recv_byte(signal line : in std_logic; variable b : out std_logic_vector(7 downto 0)) is
+  begin
+    -- Ensure idle high before searching start bit
+    if line /= '1' then
+      wait until line = '1';
+    end if;
+
+    -- Find a VALID start bit (falling edge + still low at mid-start)
+    loop
+      wait until (line'event and line = '0');  -- candidate start edge
+      wait for BIT_TIME/2;                     -- middle of start bit
+      exit when line = '0';                    -- accept only if still low
+      -- otherwise it was a data-edge/glitch, continue searching
+    end loop;
+
+    -- Now go to center of bit0 (from mid-start -> mid-bit0 is +1 bit)
+    wait for BIT_TIME;
+
+    -- Sample 8 data bits at centers (LSB first)
+    for i in 0 to 7 loop
+      b(i) := line;
+      wait for BIT_TIME;
+    end loop;
+
+    -- We are now at START of stop bit; sample at CENTER of stop bit
+    wait for BIT_TIME/2;
+    if line /= '1' then
+      report "Stop bit not high (sampling)" severity warning;
+    end if;
+    wait for BIT_TIME/2;
+  end procedure;
 
 begin
   -- clock generation
   clk50 <= not clk50 after CLK_PERIOD/2;
 
-  -- DUT
+  -- DUT instantiation
   dut: entity work.everloop_top_ext
     generic map (
       CLK_HZ      => CLK_HZ,
@@ -77,112 +122,59 @@ begin
       led_dout => led_dout
     );
 
-  --------------------------------------------------------------------
-  -- UART TX MONITOR (cycle-counting, no wait-for timing drift)
-  --------------------------------------------------------------------
-  monitor: process(clk50)
-    type mstate_t is (M_IDLE, M_START, M_DATA, M_STOP);
-    variable st : mstate_t := M_IDLE;
-
-    variable prev_tx : std_logic := '1';
-    variable cnt     : integer := 0;
-    variable bit_idx : integer := 0;
-    variable sh      : std_logic_vector(7 downto 0) := (others => '0');
-
-    -- sample points
-    constant HALF_BIT : integer := BAUD_DIV/2;      -- 217
-    constant BIT_END  : integer := BAUD_DIV-1;      -- 433
-  begin
-    if rising_edge(clk50) then
-      got_packet <= '0';
-
-      if reset_n = '0' then
-        st       := M_IDLE;
-        prev_tx  := '1';
-        cnt      := 0;
-        bit_idx  := 0;
-        sh       := (others => '0');
-        rx_count <= 0;
-      else
-        case st is
-          when M_IDLE =>
-            cnt := 0;
-            -- detect falling edge to start bit
-            if (prev_tx = '1') and (uart_tx = '0') then
-              st  := M_START;
-              cnt := 0;
-            end if;
-
-          when M_START =>
-            -- validate start bit at mid start
-            if cnt = HALF_BIT then
-              if uart_tx /= '0' then
-                -- false start, go back
-                st := M_IDLE;
-              end if;
-            end if;
-
-            if cnt = BIT_END then
-              st      := M_DATA;
-              cnt     := 0;
-              bit_idx := 0;
-            else
-              cnt := cnt + 1;
-            end if;
-
-          when M_DATA =>
-            -- sample each data bit at mid-bit
-            if cnt = HALF_BIT then
-              sh(bit_idx) := uart_tx; -- LSB first
-            end if;
-
-            if cnt = BIT_END then
-              cnt := 0;
-              if bit_idx = 7 then
-                st := M_STOP;
-              else
-                bit_idx := bit_idx + 1;
-              end if;
-            else
-              cnt := cnt + 1;
-            end if;
-
-          when M_STOP =>
-            -- sample stop bit at mid stop
-            if cnt = HALF_BIT then
-              -- If this fails here, TX truly violated stop, not TB drift.
-              assert uart_tx = '1'
-                report "STOP BIT LOW (true violation at mid-stop)" severity warning;
-            end if;
-
-            if cnt = BIT_END then
-              -- push byte
-              if rx_count < 8 then
-                rx_bytes(rx_count) <= sh;
-                rx_count <= rx_count + 1;
-                if rx_count = 7 then
-                  got_packet <= '1';
-                end if;
-              end if;
-              st  := M_IDLE;
-              cnt := 0;
-            else
-              cnt := cnt + 1;
-            end if;
-        end case;
-
-        prev_tx := uart_tx;
-      end if;
-    end if;
-  end process;
-
-  --------------------------------------------------------------------
-  -- STIMULUS + CHECKER
-  --------------------------------------------------------------------
   stim: process
-    variable b0,b1,b2,b3,b4,b5,b6,b7 : std_logic_vector(7 downto 0);
+    variable r0,r1,r2,r3,r4,r5,r6,r7 : std_logic_vector(7 downto 0);
   begin
     uart_rx <= '1';
 
+    -- reset
     reset_n <= '0';
-    wait for
+    wait for 20 us;
+    reset_n <= '1';
+    wait for 20 us;
+
+    -- Send READ_DEFAULT_REG: AA 01 00 AB 55
+    report "TX: AA 01 00 AB 55 (READ_DEFAULT_REG)" severity note;
+    uart_send_byte(uart_rx, x"AA");
+    uart_send_byte(uart_rx, x"01");
+    uart_send_byte(uart_rx, x"00");
+    uart_send_byte(uart_rx, x"AB");
+    uart_send_byte(uart_rx, x"55");
+
+    -- Receive response: CC 01 00 02 23 01 ED 33
+    uart_recv_byte(uart_tx, r0);
+    uart_recv_byte(uart_tx, r1);
+    uart_recv_byte(uart_tx, r2);
+    uart_recv_byte(uart_tx, r3);
+    uart_recv_byte(uart_tx, r4);
+    uart_recv_byte(uart_tx, r5);
+    uart_recv_byte(uart_tx, r6);
+    uart_recv_byte(uart_tx, r7);
+
+    report "RX: "
+      & byte_to_hex(r0) & " "
+      & byte_to_hex(r1) & " "
+      & byte_to_hex(r2) & " "
+      & byte_to_hex(r3) & " "
+      & byte_to_hex(r4) & " "
+      & byte_to_hex(r5) & " "
+      & byte_to_hex(r6) & " "
+      & byte_to_hex(r7) severity note;
+
+    -- Assertions
+    assert r0 = x"CC" report "Bad SOF (expected CC)" severity failure;
+    assert r1 = x"01" report "Bad CMD (expected 01)" severity failure;
+    assert r2 = x"00" report "Bad STATUS (expected 00)" severity failure;
+    assert r3 = x"02" report "Bad LEN (expected 02)" severity failure;
+    assert r4 = x"23" report "Bad DATA[0] (expected 23)" severity failure;
+    assert r5 = x"01" report "Bad DATA[1] (expected 01)" severity failure;
+    assert r6 = x"ED" report "Bad CHK (expected ED)" severity failure;
+    assert r7 = x"33" report "Bad EOF (expected 33)" severity failure;
+
+    report "READ_DEFAULT_REG test PASSED" severity note;
+
+    wait for 200 us;
+    assert false report "Simulation finished" severity failure;
+  end process;
+
+end architecture;
