@@ -12,7 +12,10 @@ architecture sim of tb_everloop_uart is
   constant N_LEDS : integer := 31;
 
   constant CLK_PERIOD : time := 20 ns;
-  constant BIT_TIME   : time := 1 sec / BAUD;  -- ~8.68 us @115200
+
+  -- IMPORTANT: match DUT bit time based on integer BAUD_DIV
+  constant BAUD_DIV   : integer := CLK_HZ / BAUD;         -- 434
+  constant BIT_TIME   : time := BAUD_DIV * CLK_PERIOD;    -- 434 * 20ns = 8680 ns
 
   -- DUT signals
   signal clk50    : std_logic := '0';
@@ -68,28 +71,29 @@ architecture sim of tb_everloop_uart is
     wait for BIT_TIME;
   end procedure;
 
-  -- UART receive byte from uart_tx line (8N1, LSB first)
+  -- Robust UART receive byte from uart_tx line (8N1, LSB first)
+  -- Uses falling edge of start bit and samples at bit centers.
   procedure uart_recv_byte(signal line : in std_logic; variable b : out std_logic_vector(7 downto 0)) is
   begin
-    -- wait for start bit
-    wait until line = '0';
+    -- Wait for a real falling edge (start bit)
+    wait until (line = '0' and line'event);
 
-    -- go to middle of start bit
-    wait for BIT_TIME/2;
+    -- Go to center of bit0: 1.5 bit times from start edge
+    wait for BIT_TIME + (BIT_TIME/2);
 
-    -- go to middle of bit0
-    wait for BIT_TIME;
-
+    -- Sample 8 data bits at center
     for i in 0 to 7 loop
       b(i) := line;
       wait for BIT_TIME;
     end loop;
 
-    -- stop bit should be high
-    assert line = '1' report "UART stop bit not high" severity warning;
+    -- Now we are at center of stop bit (because we waited BIT_TIME after bit7)
+    if line /= '1' then
+      report "UART stop bit not high" severity warning;
+    end if;
 
-    -- finish stop bit time
-    wait for BIT_TIME;
+    -- Move to end of stop bit (optional)
+    wait for BIT_TIME/2;
   end procedure;
 
 begin
@@ -115,7 +119,7 @@ begin
     variable idx  : std_logic_vector(7 downto 0);
     variable g    : std_logic_vector(7 downto 0);
     variable r    : std_logic_vector(7 downto 0);
-    variable b    : std_logic_vector(7 downto 0);
+    variable bb   : std_logic_vector(7 downto 0); -- use bb to avoid name clash with signal b
     variable w    : std_logic_vector(7 downto 0);
     variable chk  : std_logic_vector(7 downto 0);
 
@@ -131,26 +135,26 @@ begin
     -- Reset
     reset_n <= '0';
     uart_rx <= '1';
-    wait for 500 ns;
+    wait for 2 us;
     reset_n <= '1';
-    wait for 500 ns;
+    wait for 2 us;
 
     -- Build a valid command: set LED0 to BLUE (G=0,R=0,B=255,W=0)
     idx := x"00";
     g   := x"00";
     r   := x"00";
-    b   := x"FF";
+    bb  := x"FF";
     w   := x"00";
 
     -- chk = XOR(bytes 0..5) where byte0 is 0xAA
-    chk := x"AA" xor idx xor g xor r xor b xor w;
+    chk := x"AA" xor idx xor g xor r xor bb xor w;
 
     -- Send frame: AA idx G R B W chk 55
     uart_send_byte(uart_rx, x"AA");
     uart_send_byte(uart_rx, idx);
     uart_send_byte(uart_rx, g);
     uart_send_byte(uart_rx, r);
-    uart_send_byte(uart_rx, b);
+    uart_send_byte(uart_rx, bb);
     uart_send_byte(uart_rx, w);
     uart_send_byte(uart_rx, chk);
     uart_send_byte(uart_rx, x"55");
@@ -176,19 +180,15 @@ begin
     assert ack5 = x"33" report "ACK[5] not 0x33" severity failure;
     assert ack1 = idx   report "ACK idx mismatch" severity failure;
 
-    -- status should be OK
     assert ack2 = x"00" report "ACK status not OK (0x00)" severity failure;
+    assert ack3 = chk   report "ACK echo_chk mismatch" severity failure;
 
-    -- echo checksum should match sent chk
-    assert ack3 = chk report "ACK echo_chk mismatch" severity failure;
-
-    -- resp_chk = XOR(CC, idx, status, echo_chk)
     resp_chk := ack0 xor ack1 xor ack2 xor ack3;
     assert ack4 = resp_chk report "ACK resp_chk mismatch" severity failure;
 
     report "UART RX + ACK test PASSED" severity note;
 
-    wait for 1 ms;
+    wait for 200 us;
     assert false report "Simulation finished" severity failure;
   end process;
 
